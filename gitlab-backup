@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+
+import httpx
+from rich.progress import track
+
+BACKUP_PATH = Path(__file__).parent / "backups"
+
+
+def tasks_with_concurrency(n, *tasks):
+    semaphore = asyncio.Semaphore(n)
+
+    async def sem_task(task):
+        async with semaphore:
+            return await task
+
+    return [sem_task(task) for task in tasks]
+
+
+async def graphql_query(client, query):
+    r = await client.post("/api/graphql", data={"query": query})
+    r.raise_for_status()
+    data = r.json()
+    assert "errors" not in data, data
+    return data["data"]
+
+
+async def _test_repo_queries(client):
+    query = """
+{
+  currentUser {
+    groupMemberships {
+      nodes {
+        group {
+          projects {
+            nodes {
+              sshUrlToRepo
+            }
+          }
+        }
+      }
+    }
+    projectMemberships {
+      nodes {
+        project {
+          sshUrlToRepo
+        }
+      }
+    }
+  }
+  projects(membership: true) {
+    nodes {
+      sshUrlToRepo
+    }
+  }
+}
+"""
+
+    data = await graphql_query(client, query)
+
+    group_projects = set(
+        r["sshUrlToRepo"]
+        for g in data["currentUser"]["groupMemberships"]["nodes"]
+        for r in g["group"]["projects"]["nodes"]
+    )
+    membership_projects = set(
+        r["project"]["sshUrlToRepo"]
+        for r in data["currentUser"]["projectMemberships"]["nodes"]
+    )
+    membership_projects_alt = set(r["sshUrlToRepo"] for r in data["projects"]["nodes"])
+
+    print(f"Group projects: {len(group_projects)}")
+    print(f"Membership projects: {len(membership_projects)}")
+    print(f"Membership projects alt: {len(membership_projects_alt)}")
+
+    print(f"{group_projects & membership_projects=}")
+    print(f"{group_projects - membership_projects_alt=}")
+    print(f"{membership_projects - membership_projects_alt=}")
+
+    print(f"{membership_projects_alt - group_projects - membership_projects=}")
+
+
+async def backup_project(client, host, project_path, git_url, dry_run=False):
+    path = BACKUP_PATH / host / f"{project_path}.git"
+
+    print(f"[-] Backing up {project_path}")
+
+    if dry_run:
+        return
+
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "clone",
+        "--mirror",
+        "--",
+        git_url,
+        path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        print(
+            f"[!] Failed to download {project_path}, error from git:", file=sys.stderr
+        )
+        print(str(stderr, "utf-8"), file=sys.stderr)
+        return
+
+
+async def get_projects(client):
+    query = """
+{
+  projects(membership: true) {
+    nodes {
+      fullPath
+      sshUrlToRepo
+    }
+  }
+}
+    """
+    data = await graphql_query(client, query)
+    projects = data["projects"]["nodes"]
+    return projects
+
+
+async def backup(client, args):
+    print(f"[-] Fetching list of projects.")
+    projects = await get_projects(client)
+
+    print(f"[+] Found {len(projects)} projects.")
+
+    tasks = tasks_with_concurrency(
+        5,
+        *(
+            backup_project(
+                client,
+                args.host,
+                project["fullPath"],
+                project["sshUrlToRepo"],
+                dry_run=args.dry_run,
+            )
+            for project in projects
+        ),
+    )
+    for t in track(asyncio.as_completed(tasks), total=len(tasks)):
+        await t
+
+    print(f"[+] Done.")
+
+
+def get_backup_repo_name(group, project):
+    # TODO: Handle other usernames
+    if group == "tyilo":
+        return project
+
+    return f"{group}-{project}"
+
+
+async def create_repo(client, name):
+    r = await client.post(
+        "/api/v4/projects",
+        data={
+            "name": name,
+        },
+    )
+    r.raise_for_status()
+    return r.json()["ssh_url_to_repo"]
+
+
+async def restore_project(
+    client, host, git_directory, existing_name_to_git_url, dry_run=False
+):
+    project = git_directory.stem
+    group = git_directory.parent.name
+
+    name = get_backup_repo_name(group, project)
+    print(f"[-] Restoring {group} / {project} to {name}")
+
+    if dry_run:
+        return
+
+    git_url = existing_name_to_git_url.get(name)
+    if not git_url:
+        git_url = await create_repo(client, name)
+
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "push",
+        "--mirror",
+        "--",
+        git_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=git_directory,
+    )
+
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        print(f"[!] Failed to push to {git_url}, error from git:", file=sys.stderr)
+        print(str(stderr, "utf-8"), file=sys.stderr)
+        return
+
+
+async def restore(client, args):
+    backup_path = BACKUP_PATH / args.src_host
+    if not backup_path.is_dir():
+        print(f"[!] Couldn't find backup for {args.src_host} ({backup_path}).")
+        return False
+
+    print(f"Fetching list of existing projects.")
+    existing_projects = await get_projects(client)
+    existing_name_to_git_url = {
+        p["fullPath"].split("/")[-1]: p["sshUrlToRepo"] for p in existing_projects
+    }
+
+    tasks = tasks_with_concurrency(
+        5,
+        *(
+            restore_project(
+                client,
+                args.dst_host,
+                project,
+                existing_name_to_git_url=existing_name_to_git_url,
+                dry_run=args.dry_run,
+            )
+            for group in sorted(backup_path.iterdir())
+            for project in sorted(group.iterdir())
+        ),
+    )
+
+    print(f"[-] Restoring {len(tasks)} projects.")
+
+    for t in track(asyncio.as_completed(tasks), total=len(tasks)):
+        await t
+
+    print(f"[+] Done.")
+
+    return True
+
+
+async def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(required=True, dest="cmd")
+
+    backup_parser = subparsers.add_parser("backup")
+    backup_parser.set_defaults(func=backup)
+    backup_parser.add_argument("host")
+    backup_parser.add_argument("--dry-run", action="store_true")
+
+    restore_parser = subparsers.add_parser("restore")
+    restore_parser.set_defaults(func=restore)
+    restore_parser.add_argument("src_host")
+    restore_parser.add_argument("dst_host")
+    restore_parser.add_argument("--dry-run", action="store_true")
+
+    args = parser.parse_args()
+
+    with (Path(__file__).parent / ".access_tokens.json").open("r") as f:
+        access_tokens = json.load(f)
+
+    if args.cmd == "backup":
+        api_host = args.host
+    else:
+        api_host = args.dst_host
+
+    access_token = access_tokens.get(api_host)
+    if not access_token:
+        print(
+            f"[!] No access token found for {args.host} in .access_tokens.json",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    async with httpx.AsyncClient(
+        headers={
+            "Authorization": f"Bearer {access_token}",
+        },
+        base_url=f"https://{api_host}",
+    ) as client:
+        # _test_repo_queries(client)
+        await args.func(client, args)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
