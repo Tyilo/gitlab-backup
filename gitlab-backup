@@ -117,6 +117,9 @@ async def backup_project(client, host, project_path, git_url, dry_run=False):
 async def get_projects(client):
     query = """
 {
+  currentUser {
+    username
+  }
   projects(membership: true) {
     nodes {
       fullPath
@@ -127,12 +130,27 @@ async def get_projects(client):
     """
     data = await graphql_query(client, query)
     projects = data["projects"]["nodes"]
-    return projects
+    username = data["currentUser"]["username"]
+    return username, projects
+
+
+def get_info_path(host):
+    return BACKUP_PATH / host / "info.json"
 
 
 async def backup(client, args):
     print(f"[-] Fetching list of projects.")
-    projects = await get_projects(client)
+    username, projects = await get_projects(client)
+
+    info_path = get_info_path(args.host)
+    info_path.parent.mkdir(parents=True, exist_ok=True)
+    with info_path.open("w") as f:
+        json.dump(
+            {
+                "username": username,
+            },
+            f,
+        )
 
     print(f"[+] Found {len(projects)} projects.")
 
@@ -155,9 +173,8 @@ async def backup(client, args):
     print(f"[+] Done.")
 
 
-def get_backup_repo_name(group, project):
-    # TODO: Handle other usernames
-    if group == "tyilo":
+def get_backup_repo_name(group, project, src_username):
+    if group == src_username:
         return project
 
     return f"{group}-{project}"
@@ -175,13 +192,13 @@ async def create_repo(client, name):
 
 
 async def restore_project(
-    client, host, git_directory, existing_name_to_git_url, dry_run=False
+    client, host, git_directory, src_username, existing_name_to_git_url, dry_run=False
 ):
     project = git_directory.stem
     group = git_directory.parent.name
 
-    name = get_backup_repo_name(group, project)
-    print(f"[-] Restoring {group} / {project} to {name}")
+    name = get_backup_repo_name(group, project, src_username)
+    print(f"[-] Restoring {group}/{project} to {name}")
 
     if dry_run:
         return
@@ -215,11 +232,19 @@ async def restore(client, args):
         print(f"[!] Couldn't find backup for {args.src_host} ({backup_path}).")
         return False
 
+    info_path = get_info_path(args.src_host)
+    with info_path.open("r") as f:
+        info = json.load(f)
+
+    src_username = info["username"]
+
     print(f"Fetching list of existing projects.")
-    existing_projects = await get_projects(client)
+    dst_username, existing_projects = await get_projects(client)
     existing_name_to_git_url = {
         p["fullPath"].split("/")[-1]: p["sshUrlToRepo"] for p in existing_projects
     }
+
+    backed_up_projects = backup_path.glob("*/*.git")
 
     tasks = tasks_with_concurrency(
         5,
@@ -228,11 +253,11 @@ async def restore(client, args):
                 client,
                 args.dst_host,
                 project,
+                src_username=src_username,
                 existing_name_to_git_url=existing_name_to_git_url,
                 dry_run=args.dry_run,
             )
-            for group in sorted(backup_path.iterdir())
-            for project in sorted(group.iterdir())
+            for project in sorted(backed_up_projects)
         ),
     )
 
@@ -274,7 +299,7 @@ async def main():
     access_token = access_tokens.get(api_host)
     if not access_token:
         print(
-            f"[!] No access token found for {args.host} in .access_tokens.json",
+            f"[!] No access token found for {api_host} in .access_tokens.json",
             file=sys.stderr,
         )
         sys.exit(1)

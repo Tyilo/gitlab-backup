@@ -30,6 +30,5 @@ To backup all projects you have access to on `gitlab.com` and push them `gitlab.
 
 ## TODO
 
-- Don't hardcode my username for detecting own projects when restoring
 - Allow a custom naming scheme when restoring
 - Better error handling with retries
